@@ -141,3 +141,8 @@ cython_debug/
 data/othello_synthetic
 data/othello_championship
 ckpts/*
+
+# Downloaded model, generated experiment data, and run artifacts
+synthetic_model.pth
+data/probe_reproduction/
+output/linear_probe_reproduction/
