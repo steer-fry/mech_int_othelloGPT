@@ -130,4 +130,154 @@ The nested mixed FLIP/ERASE evaluation is specified in [MIX_EVAL.md](MIX_EVAL.md
 It uses one sampled set of eight tiles per eligible prefix, with nested k=2, 4,
 and 8 edits and no additional all-FLIP or all-ERASE control arms.
 
+## Training the editor MLP
+
+`mech_int/train_editor.py` implements [TRAIN.md](TRAIN.md): eight independent
+width-128 ReLU editors act on the final input token after each frozen transformer
+block. All editors train jointly, with gradients through the transformer and a
+uniform legal-move cross-entropy normalized over the full 61-token vocabulary.
+Zero-initialized output matrices make the initial model match OthelloGPT exactly;
+omitting the rule bypasses every editor.
+
+The trainer reuses the existing probe-reproduction game splits. Training selects
+FLIP/ERASE with equal probability and a target stratum: 90% edits that change the
+legal-move set, 10% unchanged controls. It proposes games with replacement,
+prefix lengths uniformly from 1–59, and occupied noncentral squares uniformly,
+retrying within the chosen action and stratum. The original simulator supplies
+the actual turn and implicit-pass targets; terminal edits are skipped.
+Validation and test retain the same fixed seeded examples as the first run
+(512 and 1,000 examples), with separate metrics for changed and unchanged legal
+sets. `--changed-target-fraction` configures the training mixture;
+`--natural-training-sampling` reproduces the original candidate distribution.
+
+```bash
+.venv/bin/python scripts/verify_editor_model.py --device both
+.venv/bin/python scripts/verify_editor_data.py
+.venv/bin/python -u -m mech_int.train_editor --device mps --bottleneck 128 --changed-target-fraction 0.9
+.venv/bin/python scripts/evaluate_editor_benchmark.py --run-dir output/editor_mlp_128_changed90 --device mps
+```
+
+Defaults follow TRAIN.md: batch size 64, AdamW learning rate 3e-4, weight decay
+1e-4, seed 42, constant learning rate, validation every 500 updates, at most
+10,000 updates, and patience 10. Outputs in `output/editor_mlp_128_changed90/` include
+`training.log` when redirected by the launcher, `training_status.json`, fixed
+evaluation examples, configuration with source/data hashes, validation history,
+`best_editors.pth`, resumable state every 50 updates, and automatic final test
+results. Top-k exact legal-set accuracy and false positives/negatives use all 61
+tokens, where k is the edited target's legal-move count. Resume with the same
+settings and `--resume`; use `--mode evaluate` to reevaluate the selected
+checkpoint. Choose a new `--output` for a fresh run.
+
+The benchmark evaluator compares the validation-selected editors with the Nanda
+linear intervention on the released 1,001 cases. It saves all-record and
+first-1,000 results, mean set errors, exact legal-set accuracy, and the evaluated
+weight snapshot in the run's `interventions/` directory. The original width-32
+run and its source snapshot remain in `output/editor_mlp/`.
+
+## Persistent one-time linear interventions
+
+`mech_int/reproduce_persistent_interventions.py` implements
+[PERSISTENT_EVAL.md](PERSISTENT_EVAL.md). It applies the released FLIP/ERASE
+directions once at the final original-prefix token, preserves independent real
+autoregressive KV caches for patched and baseline passes, and continues without
+further steering. Both caches receive the same seed-42 moves sampled from the
+evolving edited board, including natural captures and simulator implicit passes.
+
+```bash
+.venv/bin/python scripts/verify_persistent_interventions.py --device both
+.venv/bin/python -u -m mech_int.reproduce_persistent_interventions --device auto --batch-size 64
+.venv/bin/python scripts/audit_persistent_interventions.py
+```
+
+The full float32 Apple GPU run evaluated all 1,001 released cases per action.
+Exact legal-move set accuracy was:
+
+| Edit | Horizon | Scored cases | Patched | Baseline | Patched mean FP+FN | Baseline mean FP+FN |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| FLIP | 0 | 1,001 | 96.10% | 3.30% | 0.087912 | 2.723277 |
+| FLIP | 1 | 1,001 | 25.87% | 18.78% | 2.289710 | 2.701299 |
+| FLIP | 10 | 1,001 | 69.73% | 70.13% | 1.022977 | 1.002997 |
+| ERASE | 0 | 1,001 | 99.10% | 2.60% | 0.021978 | 2.733267 |
+| ERASE | 1 | 1,001 | 25.67% | 24.08% | 2.005994 | 2.049950 |
+| ERASE | 10 | 1,000 | 47.50% | 47.20% | 1.592000 | 1.596000 |
+
+The immediate steering advantage decays sharply after one move and is small by
+h=2 (0.90 percentage points for FLIP; 0.50 for ERASE). At h=10 the patched model
+has no substantial advantage over the baseline. Later accuracy rises in both
+arms as the shared moves evolve the edited board; this rise alone does not show
+that the one-time intervention persisted.
+
+Every FLIP trajectory reached h=10. One ERASE trajectory became terminal at h=5;
+its terminal step has null scores, so ERASE denominators are 1,000 from h=5
+onward. No trajectory reached the 59-token input limit. The evaluation includes
+all h=0 failures and applies no success-based filtering.
+
+Numerical verification compared 16 sampled cases through h=10 with actual
+TransformerLens 1.6.0 full-history hooks at the **original prefix position** on
+CPU and MPS. All checked top-N sets matched; the largest logit discrepancy was
+0.0000372. Chunked decoding, cache row filtering, repeated ERASE tokens, implicit
+passes, terminal boards, and context limits were checked. All 4,004 immediate
+method/case predictions also matched the existing intervention runner.
+
+Artifacts in `output/linear_probe_reproduction/persistent_interventions/`
+include per-case JSON with board states, targets, continuation tokens and
+predictions, per-step CSV, all-horizon `summary.csv`, `results.json`, source/input
+hashes, numerical verification, and an independent simulator/score audit.
+`scripts/plot_persistent_interventions.py` optionally generates PNG/SVG figures
+from saved results using Matplotlib.
+
+## Unsteered ordinary-game accuracy
+
+`mech_int/reproduce_clean_continuations.py` continues the same 1,001 benchmark
+prefixes on their original boards, with no board edits and no steering. It
+samples ten uniformly random legal moves per record using seed 42 and scores
+the unchanged model at h=0 through h=10. All records reach h=10, giving 11,011
+scored predictions; two continuations contain an implicit pass.
+
+```bash
+.venv/bin/python -u -m mech_int.reproduce_clean_continuations --device auto --batch-size 64
+.venv/bin/python scripts/audit_clean_continuations.py
+.venv/bin/python scripts/compare_persistent_controls.py
+```
+
+The full float32 Apple GPU control gives:
+
+| Metric | Correct / scored | Accuracy |
+| --- | ---: | ---: |
+| Top-1 prediction is a legal move | 11,008 / 11,011 | 99.9728% |
+| Top-N predictions exactly recover the complete legal set | 10,984 / 11,011 | 99.7548% |
+| Top-1 equals the sampled next token | 1,071 / 11,011 | 9.7266% |
+
+The next token is uniformly sampled among legal moves. Any legal deterministic
+prediction therefore has expected match probability 1/N at a position with N
+legal moves; this averages 9.4502% in the control. Exact sampled-token accuracy
+and move legality measure different things. Argmax uses the full 61-token
+vocabulary, including padding; predicting padding counts as illegal.
+
+For direct comparison with the intervention evaluation's exact-set metric:
+
+| Horizon | Scored cases | Ordinary-game exact legal-set accuracy | Top-1 move legality |
+| --- | ---: | ---: | ---: |
+| 0 | 1,001 | 99.9001% | 100.0000% |
+| 1 | 1,001 | 100.0000% | 100.0000% |
+| 2 | 1,001 | 99.9001% | 100.0000% |
+| 10 | 1,001 | 99.2008% | 99.9001% |
+
+Ordinary-game legal-set accuracy remains near perfect while accuracy against
+counterfactual edited boards falls. The ordinary control follows its own legal
+continuation after h=0; the patched versus unsteered edited-board comparison
+continues to use identical continuation tokens and remains the paired steering
+comparison. The original-board control curve appears in both edit panels.
+
+Results live in
+`output/linear_probe_reproduction/persistent_interventions/ordinary_game_control/`:
+all-horizon `summary.csv`, per-case JSON containing full logits and next-token
+targets, per-step CSV, configuration, numerical checks, and `artifact_audit.json`.
+The independent audit checks every legal set, full-vocabulary argmax, sampled
+token target, next-token NLL, summary and CSV row. All 2,002 immediate unsteered
+edited-target comparisons and 18 cached/full-history numerical checks passed.
+The updated three-arm comparison is saved as `comparison_with_ordinary_control`
+JSON/CSV, and plots distinguish next-token matching, legal-move validity, and
+exact legal-set accuracy.
+
 

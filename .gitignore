@@ -146,3 +146,5 @@ ckpts/*
 synthetic_model.pth
 data/probe_reproduction/
 output/linear_probe_reproduction/
+output/editor_mlp/
+output/editor_mlp_128_changed90/

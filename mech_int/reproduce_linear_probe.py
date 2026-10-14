@@ -6,6 +6,7 @@ All eight independent probes share a frozen forward pass, never their weights.
 
 import argparse
 import csv
+from dataclasses import dataclass
 import hashlib
 import importlib.metadata
 import json
@@ -30,6 +31,31 @@ def write_json(path, obj):
     temporary.replace(path)
 
 
+@dataclass(frozen=True)
+class FrozenKVCache:
+    """Autoregressive keys and values, one ``(K, V)`` pair per block.
+
+    Each tensor has shape ``[batch, head, position, head_dimension]``. Cache
+    updates create fresh tensors, so clean and steered histories can branch
+    without modifying one another. This is distinct from a residual activation
+    cache used for probe training.
+    """
+
+    layers: tuple[tuple[torch.Tensor, torch.Tensor], ...]
+
+    @property
+    def length(self):
+        return self.layers[0][0].shape[2] if self.layers else 0
+
+    def index_select(self, indices):
+        """Return a fresh cache containing the requested batch rows."""
+        return FrozenKVCache(tuple(
+            (key.index_select(0, indices.to(device=key.device, dtype=torch.long)),
+             value.index_select(0, indices.to(device=value.device, dtype=torch.long)))
+            for key, value in self.layers
+        ))
+
+
 class FrozenBlock(nn.Module):
     def __init__(self, sd, layer):
         super().__init__()
@@ -49,22 +75,34 @@ class FrozenBlock(nn.Module):
         x = x - x.mean(dim=-1, keepdim=True)
         return x / (x.square().mean(dim=-1, keepdim=True) + 1e-5).sqrt()
 
-    def forward(self, x, attention_delta=None):
+    def _forward(self, x, attention_delta=None, attention_position=None, past_kv=None):
         batch, positions, _ = x.shape
+        offset = 0 if past_kv is None else past_kv[0].shape[2]
         qkv = self.normalize(x) @ self.qkv_weight + self.qkv_bias
         q, k, v = [a.reshape(batch, positions, 8, 64).transpose(1, 2) for a in qkv.chunk(3, dim=-1)]
+        if past_kv is not None:
+            k = torch.cat((past_kv[0], k), dim=2)
+            v = torch.cat((past_kv[1], v), dim=2)
         scores = (q @ k.transpose(-1, -2)) / 8.0
-        scores = scores.masked_fill(~self.mask[:positions, :positions], -1e5)
+        scores = scores.masked_fill(~self.mask[offset:offset + positions, :offset + positions], -1e5)
         z = (scores.softmax(-1) @ v).transpose(1, 2).reshape(batch, positions, 512)
         attention_out = z @ self.output_weight + self.output_bias
-        if attention_delta is not None:
+        patch_position = positions - 1 if attention_position is None else attention_position - offset
+        if attention_delta is not None and 0 <= patch_position < positions:
             # Equivalent to patching blocks.<layer>.hook_attn_out in the
-            # released intervention scripts, at the final history token only.
+            # released intervention scripts. Explicit absolute positions let a
+            # full-history reference patch the original prefix token only.
             attention_out = attention_out.clone()
-            attention_out[:, -1, :] = attention_out[:, -1, :] + attention_delta
+            attention_out[:, patch_position, :] = attention_out[:, patch_position, :] + attention_delta
         x = x + attention_out
         hidden = F.gelu(self.normalize(x) @ self.W_in + self.b_in)
-        return x + (hidden @ self.W_out + self.b_out)
+        return x + (hidden @ self.W_out + self.b_out), (k, v)
+
+    def forward(self, x, attention_delta=None, attention_position=None):
+        return self._forward(x, attention_delta, attention_position)[0]
+
+    def forward_cached(self, x, past_kv=None, attention_delta=None, attention_position=None):
+        return self._forward(x, attention_delta, attention_position, past_kv)
 
 
 class FrozenOthelloGPT(nn.Module):
@@ -81,17 +119,66 @@ class FrozenOthelloGPT(nn.Module):
         self.blocks = nn.ModuleList(FrozenBlock(sd, l) for l in range(8))
         self.eval()
 
-    def residuals(self, tokens, attention_deltas=None):
+    def _validate_tokens(self, tokens, offset=0):
+        if tokens.ndim != 2 or min(tokens.shape) < 1:
+            raise ValueError("Tokens must have nonempty [batch, position] dimensions")
+        if offset + tokens.shape[1] > self.position.shape[0]:
+            raise ValueError(f"Input exceeds the {self.position.shape[0]}-token context window")
+
+    @staticmethod
+    def _validate_attention_position(attention_position, total_positions):
+        if attention_position is not None and not 0 <= attention_position < total_positions:
+            raise ValueError("Intervention position must be an absolute position within the input history")
+
+    def residuals(self, tokens, attention_deltas=None, attention_position=None):
+        self._validate_tokens(tokens)
+        self._validate_attention_position(attention_position, tokens.shape[1])
         x = self.embedding[tokens] + self.position[:tokens.shape[1]]
         for layer, block in enumerate(self.blocks):
             delta = None if attention_deltas is None else attention_deltas.get(layer)
-            x = block(x, delta)
+            x = block(x, delta, attention_position)
             yield layer, x
 
-    def forward(self, tokens, attention_deltas=None):
-        for _, residual in self.residuals(tokens, attention_deltas):
+    def forward(self, tokens, attention_deltas=None, attention_position=None):
+        for _, residual in self.residuals(tokens, attention_deltas, attention_position):
             pass
         return FrozenBlock.normalize(residual) @ self.unembedding + self.unembedding_bias
+
+    def forward_cached(self, tokens, cache=None, attention_deltas=None, attention_position=None):
+        """Process a prefix or append tokens to an autoregressive KV cache.
+
+        Return logits for the supplied tokens and a fresh ``FrozenKVCache``.
+        Positions and causal masks are offset by the existing cache length.
+        ``attention_position`` is absolute; its default is the final supplied
+        token. Cached prefix positions are never reprocessed or patched again.
+
+        A block caches its K/V before its attention-output intervention. Later
+        blocks compute their K/V from the resulting residual, preserving the
+        effects of an earlier block's intervention during unsteered decoding.
+        """
+        if cache is not None and not isinstance(cache, FrozenKVCache):
+            raise TypeError("cache must be a FrozenKVCache returned by forward_cached")
+        offset = 0 if cache is None else cache.length
+        self._validate_tokens(tokens, offset)
+        self._validate_attention_position(attention_position, offset + tokens.shape[1])
+        if cache is not None:
+            if len(cache.layers) != len(self.blocks):
+                raise ValueError("KV cache must contain one key/value pair for every block")
+            expected = (tokens.shape[0], 8, offset, 64)
+            for key, value in cache.layers:
+                if key.shape != expected or value.shape != expected:
+                    raise ValueError(f"KV cache tensors must have shape {expected}")
+                if any(t.device != self.embedding.device or t.dtype != self.embedding.dtype for t in (key, value)):
+                    raise ValueError("KV cache device and dtype must match the model")
+        x = self.embedding[tokens] + self.position[offset:offset + tokens.shape[1]]
+        layers = []
+        for layer, block in enumerate(self.blocks):
+            delta = None if attention_deltas is None else attention_deltas.get(layer)
+            past_kv = None if cache is None else cache.layers[layer]
+            x, layer_cache = block.forward_cached(x, past_kv, delta, attention_position)
+            layers.append(layer_cache)
+        logits = FrozenBlock.normalize(x) @ self.unembedding + self.unembedding_bias
+        return logits, FrozenKVCache(tuple(layers))
 
 
 class Split:
